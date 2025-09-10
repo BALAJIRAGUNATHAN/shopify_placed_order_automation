@@ -92,6 +92,14 @@ async def wait_and_click_continue(page: Page):
             continue
     return False
 
+async def fill_card_iframe_field(page: Page, frame_name_prefix: str, input_name: str, value: str):
+    iframe = page.frame_locator(f"iframe[name^='{frame_name_prefix}']").first
+    field = iframe.locator(f"input[name='{input_name}']")
+    await field.wait_for(state="visible", timeout=15000)
+    await field.click()
+    await field.fill(value)
+    await page.wait_for_timeout(400)
+
 # ------------------------- Main run -------------------------
 async def run(
     store_base: str = "https://teststore-12-1.myshopify.com",
@@ -99,8 +107,6 @@ async def run(
     product_path: str = "/products/t-shirt",
     headless: bool = False,
     screenshots_dir: str = "checkout_result",
-    abandon_cart: bool = True,
-    abandon_wait_seconds: int = 20,
 ):
     # Ensure screenshot folder exists at startup
     os.makedirs(screenshots_dir, exist_ok=True)
@@ -117,7 +123,7 @@ async def run(
     city       = rand_city()
     postal     = rand_postal()
 
-    print("=== Shopify automation start (Abandoned Cart) ===")
+    print("=== Shopify automation start ===")
     print(f"Time: {datetime.now().isoformat()}")
 
     async with async_playwright() as p:
@@ -217,7 +223,9 @@ async def run(
             await safe_fill(page, "#shipping-address1",      addr1,      name="address1")
             await safe_fill(page, "input[name='address2']",  addr2,      name="address2")
             await safe_fill(page, "input[name='postalCode']", postal,    name="postalCode")
-            await safe_fill(page, "input[autocomplete*='address-level2']", city, name="city")
+
+            # City may be hidden/auto-derived per locale; fill if present
+            await safe_fill(page, "input[autocomplete*='address-level2']", city,   name="city")
 
             # Continue buttons across steps (wait until enabled)
             print("→ Advancing checkout steps…")
@@ -234,38 +242,39 @@ async def run(
             except PlaywrightTimeoutError:
                 print("ℹ No separate shipping method step detected (or auto-selected).")
 
-            # ----------------- Abandon BEFORE payment -----------------
-            if abandon_cart:
-                print(f"⏸ Abandoning checkout BEFORE payment. Waiting {abandon_wait_seconds}s …")
+            # Payment iframes
+            print("→ Filling payment card fields…")
+            await fill_card_iframe_field(page, "card-fields-number", "number", "1")
+            await fill_card_iframe_field(page, "card-fields-expiry", "expiry", "12/32")
+            await fill_card_iframe_field(page, "card-fields-verification_value", "verification_value", "111")
+            await fill_card_iframe_field(page, "card-fields-name", "name", f"{first_name} {last_name}")
+            print("👉 Filled credit card info")
+
+            # Pay now
+            print("→ Clicking Pay now…")
+            clicked_pay = await safe_click(page, "Pay now", timeout=60000, role_button=True)
+            if not clicked_pay:
+                clicked_pay = await safe_click(page, "button:has-text('Pay now')", timeout=60000)
+            if not clicked_pay:
+                await safe_click(page, "button[type='submit']", timeout=60000)
+            print("👉 Clicked Pay now button")
+
+            # Confirmation / thank you
+            try:
+                await page.wait_for_url(re.compile(r"/(orders|thank_you|checkouts/.+/thank_you)"), timeout=60000)
+                print(f"✅ Reached confirmation URL: {page.url}")
+            except PlaywrightTimeoutError:
                 try:
-                    await page.get_by_role("button", name=re.compile("Pay now", re.I)).first.wait_for(timeout=8000)
-                except Exception:
-                    try:
-                        await page.frame_locator("iframe[name^='card-fields']").first.frame_locator("iframe").first
-                    except Exception:
-                        pass
+                    await page.locator("text=Thank you").first.wait_for(state="visible", timeout=60000)
+                    print("✅ Thank you message visible")
+                except PlaywrightTimeoutError:
+                    print("⚠️ Confirmation not detected; review the screenshot/logs.")
 
-                # Screenshot abandoned state
-                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                ss_path = os.path.join(screenshots_dir, f"abandoned_checkout_{ts}.png")
-                await page.screenshot(path=ss_path, full_page=True)
-                print(f"📸 Saved abandoned checkout screenshot: {ss_path}")
-
-                # Wait and close (simulate user dropping off)
-                await page.wait_for_timeout(abandon_wait_seconds * 1000)
-                await context.close()
-                await browser.close()
-                print("🛑 Closed browser — cart abandoned.")
-                return
-
-        # -----------------------------------------------------------
-
-        # (If abandon_cart is False, code would continue into payment/Pay now)
-        print("ℹ Abandon mode disabled, but no payment step executed.")
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        ss_path = os.path.join(screenshots_dir, f"checkout_result_{ts}.png")
-        await page.screenshot(path=ss_path, full_page=True)
-        print(f"📸 Saved screenshot: {ss_path}")
+            # Screenshot (into checkout_result/)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            ss_path = os.path.join(screenshots_dir, f"checkout_result_{ts}.png")
+            await page.screenshot(path=ss_path, full_page=True)
+            print(f"📸 Saved screenshot: {ss_path}")
 
         await context.close()
         await browser.close()
@@ -276,7 +285,5 @@ if __name__ == "__main__":
         password="z",
         product_path="/products/t-shirt",
         headless=False,                 # set True for CI/headless runs
-        screenshots_dir="checkout_result",
-        abandon_cart=True,              # Enable abandoned cart mode
-        abandon_wait_seconds=20,        # Wait 20 seconds before closing
+        screenshots_dir="checkout_result",  # all screenshots saved here
     ))
